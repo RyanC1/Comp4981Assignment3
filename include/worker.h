@@ -14,6 +14,9 @@
 /* cc ... -DHTTP_LIB_PATH=\"/opt/myapp/libhttp.so\"                    */
 /* ------------------------------------------------------------------ */
 #define HTTP_LIB_PATH "libhttp.so"
+#define PATH_MAX 8192 // NOLINT(cppcoreguidelines-macro-to-enum, modernize-macro-to-enum)
+#define DLOPEN_BUF 65536 // NOLINT(cppcoreguidelines-macro-to-enum, modernize-macro-to-enum)
+#define DLOPEN_FLAGS 0700 // NOLINT(cppcoreguidelines-macro-to-enum, modernize-macro-to-enum)
 
 /* ------------------------------------------------------------------ */
 /* Function-pointer typedefs matching the http.h public API            */

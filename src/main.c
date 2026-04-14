@@ -328,7 +328,9 @@ p101_fsm_state_t handle_args(const struct p101_env *env, struct p101_error *err,
 
     if(addr_status != 0)
     {
+        p101_error_reset(err);
         P101_ERROR_RAISE_USER(err, "Failed to parse ip address", ERR_USAGE);
+        goto done;
     }
 
     if(ctx->arguments->raw_children == NULL)
@@ -338,7 +340,7 @@ p101_fsm_state_t handle_args(const struct p101_env *env, struct p101_error *err,
     else
     {
         ctx->children = p101_parse_uint8_t(env, err, ctx->arguments->raw_children, DEFAULT_CHILDREN);
-        if(p101_error_has_error(err))
+        if(p101_error_has_error(err) || ctx->children < 1)
         {
             p101_error_reset(err);
             P101_ERROR_RAISE_USER(err, "Invalid number of children", ERR_USAGE);
@@ -605,13 +607,14 @@ static p101_fsm_state_t usage(const struct p101_env *env, struct p101_error *err
         ctx->exit_code = EXIT_FAILURE;
     }
 
-    fprintf(stderr, "Usage: %s [-s <root_dir>] [-h] [-p <port>] [-i <ip>] \n", ctx->arguments->program_name);
+    fprintf(stderr, "Usage: %s -r <root_dir> [-h] [-p <port>] [-i <ip>] [-c <max_clients>] [-s <semaphore>]\n", ctx->arguments->program_name);
     fputs("Options:\n", stderr);
     fputs("  -h                Display this help message and exit\n", stderr);
-    fputs("  -s <root_dir>     Directory to give to clients on connection (default HOME)\n", stderr);
+    fputs("  -r <root_dir>     Directory to serve contents from\n", stderr);
     fputs("  -p <port>         Port to host on (default 8000)\n", stderr);
     fputs("  -i <ip>           Ip to host on (default 0.0.0.0)\n", stderr);
     fputs("  -c <max_clients>  Max number of allow connected clients (default 5, max 255)\n", stderr);
+    fputs("  -s <semaphore>    Name of semaphore to use for ndbm (default /assign3-sem)\n", stderr);
 
     return CLEANUP;
 }

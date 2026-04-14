@@ -6,6 +6,7 @@
 #include <p101_c/p101_stdlib.h>
 #include <p101_c/p101_string.h>
 #include <signal.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -125,6 +126,8 @@ static p101_fsm_state_t wchr_watch(const struct p101_env *env, struct p101_error
             run_worker_fsm(env, err, ctx->semaphore, ctx->parent_fd, ctx->lib_path);
             P101_ERROR_RAISE_USER(err, "A Worker returned", ERR_USAGE);
         }
+
+        printf("Watcher: respawned dead worker.");
 
         sleep(3);
     }

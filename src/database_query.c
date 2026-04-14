@@ -2,10 +2,12 @@
 #include "errors.h"
 #include "signal_util.h"
 #include <ctype.h>
+#include <fcntl.h>
 #include <p101_c/p101_stdlib.h>
 #include <p101_c/p101_string.h>
 #include <p101_fsm/fsm.h>
 #include <p101_posix/p101_unistd.h>
+#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,10 +42,10 @@ struct arguments
 struct context
 {
     struct arguments *arguments;
-    const char       *semaphore;
-
-    DbHandle db;
-    int      exit_code;
+    const char       *semaphore_name;    // Rename for clarity
+    sem_t            *sem;               // The actual semaphore handle
+    DbHandle          db;
+    int               exit_code;
 };
 
 /* ------------------------------------------------------------------ */
@@ -250,11 +252,11 @@ static p101_fsm_state_t handle_args(const struct p101_env *env, struct p101_erro
 
     if(ctx->arguments->raw_sem_path == NULL)
     {
-        ctx->semaphore = DEFAULT_SEMAPHORE;
+        ctx->semaphore_name = DEFAULT_SEMAPHORE;
     }
     else
     {
-        ctx->semaphore = ctx->arguments->raw_sem_path;
+        ctx->semaphore_name = ctx->arguments->raw_sem_path;
     }
 
 done:
@@ -268,12 +270,20 @@ done:
 static p101_fsm_state_t open_resources(const struct p101_env *env, struct p101_error *err, void *context)
 {
     struct context *ctx;
-
     P101_TRACE(env);
     ctx = (struct context *)context;
 
+    ctx->sem = sem_open(ctx->semaphore_name, O_CREAT, DATABASE_MODE, 1);
+
+    if(ctx->sem == SEM_FAILED)
+    {
+        P101_ERROR_RAISE_SYSTEM(err, "sem_open failed", errno);
+        return CLEANUP;
+    }
+
     if(db_open(&ctx->db) != 0)
     {
+        sem_close(ctx->sem);    // Cleanup if DB fails
         P101_ERROR_RAISE_SYSTEM(err, "db_open failed", errno);
         return CLEANUP;
     }
@@ -293,6 +303,7 @@ static p101_fsm_state_t command_loop(const struct p101_env *env, struct p101_err
 
     while(printf("> ") > 0 && scanf("%15s", cmd) != EOF)
     {
+        int rc;
         if(exit_flag == 1)
         {
             break;
@@ -305,18 +316,20 @@ static p101_fsm_state_t command_loop(const struct p101_env *env, struct p101_err
 
         switch(cmd[0])
         {
+                // Inside command_loop switch statement:
+
             case 's': /* store */
             {
                 printf("Key: ");
-                if(scanf("%1023s", key_buf) == 1)
+                if(scanf("%1023s", key_buf) == 1 && printf("Value: ") && scanf("%1023s", val_buf) == 1)
                 {
-                    printf("Value: ");
-                    if(scanf("%1023s", val_buf) == 1)
+                    sem_wait(ctx->sem);    // LOCK
+                    rc = db_store(&ctx->db, key_buf, strlen(key_buf), val_buf, strlen(val_buf));
+                    sem_post(ctx->sem);    // UNLOCK
+
+                    if(rc != 0)
                     {
-                        if(db_store(&ctx->db, key_buf, strlen(key_buf), val_buf, strlen(val_buf)) != 0)
-                        {
-                            P101_ERROR_RAISE_USER(err, "Store operation failed", ERR_SYSTEM);
-                        }
+                        P101_ERROR_RAISE_USER(err, "Store operation failed", ERR_SYSTEM);
                     }
                 }
                 break;
@@ -325,12 +338,13 @@ static p101_fsm_state_t command_loop(const struct p101_env *env, struct p101_err
             {
                 void  *val;
                 size_t val_len;
-
                 printf("Key: ");
                 if(scanf("%1023s", key_buf) == 1)
                 {
-                    int rc;
+                    sem_wait(ctx->sem);    // LOCK
                     rc = db_fetch(&ctx->db, key_buf, strlen(key_buf), &val, &val_len);
+                    sem_post(ctx->sem);    // UNLOCK
+
                     if(rc == 1)
                     {
                         printf("Value: %.*s\n", (int)val_len, (char *)val);
@@ -352,6 +366,9 @@ static p101_fsm_state_t command_loop(const struct p101_env *env, struct p101_err
                 size_t key_len;
                 int    r;
 
+                // LOCK the entire iteration process
+                sem_wait(ctx->sem);
+
                 for(r = db_first(&ctx->db, &key, &key_len); r == 1; r = db_next(&ctx->db, &key, &key_len))
                 {
                     void  *val;
@@ -362,11 +379,16 @@ static p101_fsm_state_t command_loop(const struct p101_env *env, struct p101_err
                     p101_memcpy(env, key_copy, key, copy_len);
                     key_copy[copy_len] = '\0';
 
+                    // db_fetch is called here, but we already hold the lock from db_first
                     if(db_fetch(&ctx->db, key_copy, copy_len, &val, &val_len) == 1)
                     {
                         printf("%.*s: %.*s\n", (int)copy_len, key_copy, (int)val_len, (char *)val);
                     }
                 }
+
+                // UNLOCK after the loop finishes
+                sem_post(ctx->sem);
+
                 if(r < 0)
                 {
                     P101_ERROR_RAISE_USER(err, "Iteration failed", ERR_SYSTEM);
@@ -378,7 +400,11 @@ static p101_fsm_state_t command_loop(const struct p101_env *env, struct p101_err
                 printf("Key: ");
                 if(scanf("%1023s", key_buf) == 1)
                 {
-                    if(db_delete(&ctx->db, key_buf, strlen(key_buf)) != 0)
+                    sem_wait(ctx->sem);    // LOCK
+                    rc = db_delete(&ctx->db, key_buf, strlen(key_buf));
+                    sem_post(ctx->sem);    // UNLOCK
+
+                    if(rc != 0)
                     {
                         printf("Delete failed (key may not exist).\n");
                     }
@@ -442,6 +468,11 @@ static p101_fsm_state_t cleanup(const struct p101_env *env, struct p101_error *e
     ctx = (struct context *)context;
 
     db_close(&ctx->db);
+
+    if(ctx->sem != SEM_FAILED)
+    {
+        sem_close(ctx->sem);
+    }
 
     if(p101_error_has_error(err))
     {

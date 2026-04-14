@@ -42,6 +42,8 @@ static p101_fsm_state_t wkr_parse(const struct p101_env *env, struct p101_error 
 static p101_fsm_state_t wkr_respond(const struct p101_env *env, struct p101_error *err, void *context);
 static p101_fsm_state_t wkr_cleanup(const struct p101_env *env, struct p101_error *err, void *context);
 
+static void *dlopen_fresh(const char *lib_path, int flags);
+
 /* ------------------------------------------------------------------ */
 /* Public entry point                                                   */
 /* ------------------------------------------------------------------ */
@@ -130,7 +132,6 @@ static p101_fsm_state_t wkr_check_lib(const struct p101_env *env, struct p101_er
 {
     struct wkr_context *w_ctx;
     struct stat         st;
-    void               *sym;
     bool                should_load = false;
 
     P101_TRACE(env);
@@ -142,7 +143,6 @@ static p101_fsm_state_t wkr_check_lib(const struct p101_env *env, struct p101_er
         return WKR_CLEANUP;
     }
 
-    /* Get file status to check for changes */
     if(stat(w_ctx->abs_lib_path, &st) != 0)
     {
         fprintf(stderr, "Worker [%d]: stat '%s' failed: %s\n", getpid(), w_ctx->abs_lib_path, strerror(errno));
@@ -150,10 +150,6 @@ static p101_fsm_state_t wkr_check_lib(const struct p101_env *env, struct p101_er
         return WKR_CLEANUP;
     }
 
-    /* * Decide if we need to load:
-     * 1. If handle is NULL (first time)
-     * 2. If the modification time has changed
-     */
     if(w_ctx->lib_handle == NULL || st.st_mtime != w_ctx->last_mtime)
     {
         should_load = true;
@@ -164,46 +160,38 @@ static p101_fsm_state_t wkr_check_lib(const struct p101_env *env, struct p101_er
         return WKR_WAIT_FOR_CLIENT;
     }
 
-    /* If we are reloading, close the old handle first */
     if(w_ctx->lib_handle != NULL)
     {
-        printf("Worker [%d]: Change detected in '%s'. Reloading...\n", getpid(), HTTP_LIB_PATH);
+        printf("Worker [%d]: Change detected in '%s'. Reloading...\n", getpid(), w_ctx->abs_lib_path);
         dlclose(w_ctx->lib_handle);
         w_ctx->lib_handle = NULL;
     }
 
-    w_ctx->lib_handle = dlopen(HTTP_LIB_PATH, RTLD_NOW | RTLD_LOCAL);
+    (void)dlerror();
+    if(sem_wait(w_ctx->db_sem) != 0)
+    {
+        P101_ERROR_RAISE_USER(err, "dlopen failed", ERR_SYSTEM);
+        return WKR_CLEANUP;
+    }
+    w_ctx->lib_handle = dlopen_fresh(w_ctx->abs_lib_path, RTLD_NOW | RTLD_LOCAL);
+    sem_post(w_ctx->db_sem);
     if(!w_ctx->lib_handle)
     {
-        fprintf(stderr, "Worker [%d]: dlopen '%s': %s\n", getpid(), HTTP_LIB_PATH, dlerror());
+        fprintf(stderr, "Worker [%d]: dlopen '%s': %s\n", getpid(), w_ctx->abs_lib_path, dlerror());
         P101_ERROR_RAISE_USER(err, "dlopen failed", ERR_SYSTEM);
-        w_ctx->exit_code = EXIT_FAILURE;
         return WKR_CLEANUP;
     }
 
-    /* Update the stored timestamp after a successful dlopen */
     w_ctx->last_mtime = st.st_mtime;
 
-    (void)dlerror(); /* clear any stale error string */
+    (void)dlerror();
 
-    /* Map symbols */
-    sym                         = dlsym(w_ctx->lib_handle, "http_read_request");
-    *(void **)(&w_ctx->fn_read) = sym;
-
-    sym                             = dlsym(w_ctx->lib_handle, "http_validate_request");
-    *(void **)(&w_ctx->fn_validate) = sym;
-
-    sym                           = dlsym(w_ctx->lib_handle, "http_handle_operation");
-    *(void **)(&w_ctx->fn_handle) = sym;
-
-    sym                         = dlsym(w_ctx->lib_handle, "http_send_response");
-    *(void **)(&w_ctx->fn_send) = sym;
-
-    sym                         = dlsym(w_ctx->lib_handle, "http_free_request");
-    *(void **)(&w_ctx->fn_free) = sym;
-
-    sym                            = dlsym(w_ctx->lib_handle, "get_version");
-    *(void **)(&w_ctx->fn_version) = sym;
+    *(void **)(&w_ctx->fn_read)     = dlsym(w_ctx->lib_handle, "http_read_request");
+    *(void **)(&w_ctx->fn_validate) = dlsym(w_ctx->lib_handle, "http_validate_request");
+    *(void **)(&w_ctx->fn_handle)   = dlsym(w_ctx->lib_handle, "http_handle_operation");
+    *(void **)(&w_ctx->fn_send)     = dlsym(w_ctx->lib_handle, "http_send_response");
+    *(void **)(&w_ctx->fn_free)     = dlsym(w_ctx->lib_handle, "http_free_request");
+    *(void **)(&w_ctx->fn_version)  = dlsym(w_ctx->lib_handle, "get_version");
 
     if(!w_ctx->fn_read || !w_ctx->fn_validate || !w_ctx->fn_handle || !w_ctx->fn_send || !w_ctx->fn_free || !w_ctx->fn_version)
     {
@@ -215,8 +203,67 @@ static p101_fsm_state_t wkr_check_lib(const struct p101_env *env, struct p101_er
         return WKR_CLEANUP;
     }
 
-    printf("Worker [%d]: library '%s' loaded (mtime: %ld, version: %d).\n", getpid(), HTTP_LIB_PATH, (long)w_ctx->last_mtime, w_ctx->fn_version());
+    printf("Worker [%d]: library '%s' loaded (mtime: %ld, version: %d).\n", getpid(), w_ctx->abs_lib_path, (long)w_ctx->last_mtime, w_ctx->fn_version());
+
     return WKR_WAIT_FOR_CLIENT;
+}
+
+/**
+ * Opens a shared library via a temp-copy so that each load gets a
+ * fresh inode, bypassing ld.so's device+inode cache.
+ *
+ * The temp file is unlinked immediately after dlopen — safe because
+ * the returned handle holds a reference to the inode.
+ *
+ * Returns a valid handle on success, NULL on failure (dlerror() set).
+ */
+static void *dlopen_fresh(const char *lib_path, int flags)
+{
+    char    tmp_path[PATH_MAX];
+    void   *handle;
+    int     in;
+    int     out;
+    char    buf[DLOPEN_BUF];
+    ssize_t n;
+
+    snprintf(tmp_path, sizeof(tmp_path), "%s.reload.tmp", lib_path);
+
+    in  = open(lib_path, O_RDONLY | O_CLOEXEC);
+    out = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, DLOPEN_FLAGS);
+
+    if(in < 0 || out < 0)
+    {
+        fprintf(stderr, "dlopen_fresh: open failed: %s\n", strerror(errno));
+        goto err;
+    }
+
+    while((n = read(in, buf, sizeof(buf))) > 0)
+    {
+        if(write(out, buf, (size_t)n) != n)
+        {
+            fprintf(stderr, "dlopen_fresh: write failed: %s\n", strerror(errno));
+            goto err;
+        }
+    }
+
+    close(in);
+    close(out);
+
+    handle = dlopen(tmp_path, flags);
+    unlink(tmp_path);
+    return handle; /* NULL if dlopen failed; dlerror() is set */
+
+err:
+    if(in >= 0)
+    {
+        close(in);
+    }
+    if(out >= 0)
+    {
+        close(out);
+    }
+    unlink(tmp_path);
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -338,6 +385,8 @@ static p101_fsm_state_t wkr_read_request(const struct p101_env *env, struct p101
         return WKR_CHECK_LIB;
     }
 
+    printf("Worker [%d]: read request from client.\n", getpid());
+
     w_ctx->req_active = true;
     return WKR_PARSE;
 }
@@ -427,6 +476,8 @@ static p101_fsm_state_t wkr_respond(const struct p101_env *env, struct p101_erro
         w_ctx->client_fd = -1;
         return WKR_CHECK_LIB;
     }
+
+    printf("Worker [%d]: sent response to client.\n", getpid());
 
     if(exit_flag == 1)
     {

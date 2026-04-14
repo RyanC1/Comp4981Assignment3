@@ -15,7 +15,7 @@
 #define REQUEST_TIMEOUT_SEC 10    // NOLINT(cppcoreguidelines-macro-to-enum,modernize-macro-to-enum)
 #define SEARCH_RANGE 128          // NOLINT(cppcoreguidelines-macro-to-enum,modernize-macro-to-enum)
 #define INT_BASE 10               // NOLINT(cppcoreguidelines-macro-to-enum,modernize-macro-to-enum)
-#define VERSION 1                 // NOLINT(cppcoreguidelines-macro-to-enum,modernize-macro-to-enum)
+#define VERSION 10                // NOLINT(cppcoreguidelines-macro-to-enum,modernize-macro-to-enum)
 
 /* Maximum byte length accepted for a POST key (the request path). */
 #define MAX_POST_KEY_LEN 512    // NOLINT(cppcoreguidelines-macro-to-enum,modernize-macro-to-enum)
@@ -341,6 +341,13 @@ int http_handle_operation(HttpRequest *req, HttpResponse *res, sem_t *sem)
     res->keep_alive = req->keep_alive;
     res->file_fd    = -1;
     res->file_size  = 0;
+
+    if(strstr(req->path, "..") != NULL)
+    {
+        res->status_code    = FORBIDDEN;
+        res->status_message = "Forbidden";
+        return 0;
+    }
 
     if(req->method == METHOD_GET || req->method == METHOD_HEAD)
     {
